@@ -51,6 +51,19 @@ def parse_query_string(query_str: str) -> Dict[str, str]:
     return params
 
 
+def _parse_number(s: str) -> Union[int, float]:
+    try:
+        return int(s)
+    except ValueError:
+        return float(s)
+
+
+def _fmt(val: Union[int, float]) -> str:
+    if isinstance(val, float) and val.is_integer():
+        return str(int(val))
+    return str(val)
+
+
 def build_response(
     status_code: int,
     reason: str,
@@ -73,11 +86,51 @@ def build_response(
 
 
 # ---------------------------------------------------------------------------
+# Calculator router
+# ---------------------------------------------------------------------------
+
+KNOWN_ROUTES = {"/add", "/sub", "/mul", "/div"}
+
+
+def route_calculator(req: Request) -> Tuple[int, str, str, Optional[Dict[str, str]]]:
+    """
+    Route a parsed Request through the calculator logic.
+    Returns (status_code, reason, body_text, extra_headers).
+    """
+    if req.path not in KNOWN_ROUTES:
+        return 404, "Not Found", "Not Found", None
+
+    if req.method != "GET":
+        return 405, "Method Not Allowed", "Method Not Allowed", {"Allow": "GET"}
+
+    if "a" not in req.query or "b" not in req.query:
+        return 400, "Bad Request", "Missing query parameter 'a' or 'b'", None
+
+    try:
+        a = _parse_number(req.query["a"])
+        b = _parse_number(req.query["b"])
+    except ValueError:
+        return 400, "Bad Request", "Parameters 'a' and 'b' must be valid numbers", None
+
+    if req.path == "/add":
+        result = a + b
+    elif req.path == "/sub":
+        result = a - b
+    elif req.path == "/mul":
+        result = a * b
+    elif req.path == "/div":
+        if b == 0:
+            return 400, "Bad Request", "Division by zero", None
+        result = a / b
+
+    return 200, "OK", _fmt(result), None
+
+
+# ---------------------------------------------------------------------------
 # Raw socket I/O helpers
 # ---------------------------------------------------------------------------
 
 def _read_line(sock: socket.socket, buf: bytearray) -> bytes:
-    """Read one CRLF/LF-terminated line from buf, refilling from sock as needed."""
     while True:
         idx = buf.find(b"\n")
         if idx != -1:
@@ -91,7 +144,6 @@ def _read_line(sock: socket.socket, buf: bytearray) -> bytes:
 
 
 def _read_exact(sock: socket.socket, buf: bytearray, length: int) -> bytes:
-    """Read exactly `length` bytes from buf, refilling from sock as needed."""
     while len(buf) < length:
         chunk = sock.recv(min(4096, length - len(buf)))
         if not chunk:
@@ -109,12 +161,8 @@ def _read_exact(sock: socket.socket, buf: bytearray, length: int) -> bytes:
 def parse_one_request(sock: socket.socket, buf: bytearray) -> Optional[Request]:
     """
     Parse exactly one HTTP/1.1 request from the socket buffer.
-
-    The hard part: we must consume EXACTLY Content-Length bytes of body —
-    byte n+1 belongs to the NEXT request (pipelining). We never close
-    the connection to signal end-of-message the way HTTP/1.0 did.
+    Consumes EXACTLY Content-Length body bytes; byte n+1 stays in buf.
     """
-    # Wait until we have a complete header block (\r\n\r\n or \n\n)
     while True:
         crlf2 = buf.find(b"\r\n\r\n")
         lf2    = buf.find(b"\n\n")
@@ -127,7 +175,7 @@ def parse_one_request(sock: socket.socket, buf: bytearray) -> Optional[Request]:
         chunk = sock.recv(4096)
         if not chunk:
             if not buf:
-                return None        # clean EOF between requests
+                return None
             raise HTTPError(400, "Bad Request", "Incomplete headers", close_connection=True)
         buf.extend(chunk)
 
@@ -143,7 +191,6 @@ def parse_one_request(sock: socket.socket, buf: bytearray) -> Optional[Request]:
     if not lines:
         raise HTTPError(400, "Bad Request", "Empty request", close_connection=True)
 
-    # Request line
     parts = lines[0].split()
     if len(parts) == 3:
         method, target, version = parts
@@ -152,7 +199,6 @@ def parse_one_request(sock: socket.socket, buf: bytearray) -> Optional[Request]:
     else:
         raise HTTPError(400, "Bad Request", "Bad request line", close_connection=True)
 
-    # Headers
     headers: Dict[str, str] = {}
     for line in lines[1:]:
         if ":" not in line:
@@ -160,27 +206,24 @@ def parse_one_request(sock: socket.socket, buf: bytearray) -> Optional[Request]:
         k, v = line.split(":", 1)
         headers[k.strip().lower()] = v.strip()
 
-    # Path + query
     path, _, qs = target.partition("?")
     query = parse_query_string(qs)
 
-    # Consume body — exactly Content-Length bytes, not one more
     body = b""
     te = headers.get("transfer-encoding", "").lower()
     cl = headers.get("content-length")
 
     if "chunked" in te:
-        # RFC 7230 §4.1 chunked decoding
         parts_list = []
         while True:
             size_line = _read_line(sock, buf)
             chunk_size = int(size_line.split(b";")[0].strip(), 16)
             if chunk_size == 0:
-                while _read_line(sock, buf):  # consume trailers
+                while _read_line(sock, buf):
                     pass
                 break
             parts_list.append(_read_exact(sock, buf, chunk_size))
-            _read_line(sock, buf)  # trailing CRLF after chunk data
+            _read_line(sock, buf)
         body = b"".join(parts_list)
     elif cl is not None:
         try:
@@ -191,12 +234,15 @@ def parse_one_request(sock: socket.socket, buf: bytearray) -> Optional[Request]:
             raise HTTPError(400, "Bad Request", "Bad Content-Length", close_connection=True)
         body = _read_exact(sock, buf, n)
 
-    # HTTP/1.1 requires a Host header (RFC 7230 §5.4)
     if "host" not in headers:
         raise HTTPError(400, "Bad Request", "Host header required")
 
     return Request(method, target, path, query, version, headers, body)
 
+
+# ---------------------------------------------------------------------------
+# Connection handler
+# ---------------------------------------------------------------------------
 
 def handle_client_connection(
     client_sock: socket.socket,
@@ -227,8 +273,15 @@ def handle_client_connection(
             if req is None:
                 break
 
-            # Placeholder: will be replaced with real routing
-            client_sock.sendall(build_response(501, "Not Implemented", "Calculator not yet wired up"))
+            status, reason, body_text, extra = route_calculator(req)
+
+            conn_hdr = req.headers.get("connection", "").lower()
+            close = conn_hdr == "close" or (req.version == "HTTP/1.0" and conn_hdr != "keep-alive")
+
+            client_sock.sendall(build_response(status, reason, body_text, extra, close_connection=close))
+
+            if close:
+                break
     except Exception:
         pass
     finally:
@@ -239,12 +292,14 @@ def handle_client_connection(
 
 
 def run_server(host: str = "0.0.0.0", port: int = 8080, idle_timeout: float = 10.0) -> None:
-    """Bind the TCP socket and start accepting connections."""
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_sock.bind((host, port))
     server_sock.listen(128)
-    print(f"[*] Listening on http://{host}:{port}  (idle timeout {idle_timeout}s)")
+    print(f"[*] HTTP/1.1 Calculator Server listening on http://{host}:{port}")
+    print(f"[*] Persistent connections enabled (Keep-Alive)")
+    print(f"[*] Defensible idle timeout: {idle_timeout}s")
+    print(f"[*] Press Ctrl+C to stop.")
     try:
         while True:
             client_sock, client_addr = server_sock.accept()
