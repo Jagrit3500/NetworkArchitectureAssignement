@@ -72,6 +72,172 @@ def build_response(
     return (status_line + header_lines + "\r\n").encode("iso-8859-1") + body_bytes
 
 
+# ---------------------------------------------------------------------------
+# Raw socket I/O helpers
+# ---------------------------------------------------------------------------
+
+def _read_line(sock: socket.socket, buf: bytearray) -> bytes:
+    """Read one CRLF/LF-terminated line from buf, refilling from sock as needed."""
+    while True:
+        idx = buf.find(b"\n")
+        if idx != -1:
+            line = bytes(buf[:idx])
+            del buf[:idx + 1]
+            return line.rstrip(b"\r")
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise ConnectionResetError("Connection closed while reading line")
+        buf.extend(chunk)
+
+
+def _read_exact(sock: socket.socket, buf: bytearray, length: int) -> bytes:
+    """Read exactly `length` bytes from buf, refilling from sock as needed."""
+    while len(buf) < length:
+        chunk = sock.recv(min(4096, length - len(buf)))
+        if not chunk:
+            raise ConnectionResetError("Connection closed while reading body")
+        buf.extend(chunk)
+    data = bytes(buf[:length])
+    del buf[:length]
+    return data
+
+
+# ---------------------------------------------------------------------------
+# HTTP Request Parser
+# ---------------------------------------------------------------------------
+
+def parse_one_request(sock: socket.socket, buf: bytearray) -> Optional[Request]:
+    """
+    Parse exactly one HTTP/1.1 request from the socket buffer.
+
+    The hard part: we must consume EXACTLY Content-Length bytes of body —
+    byte n+1 belongs to the NEXT request (pipelining). We never close
+    the connection to signal end-of-message the way HTTP/1.0 did.
+    """
+    # Wait until we have a complete header block (\r\n\r\n or \n\n)
+    while True:
+        crlf2 = buf.find(b"\r\n\r\n")
+        lf2    = buf.find(b"\n\n")
+        if crlf2 != -1 and (lf2 == -1 or crlf2 <= lf2):
+            hdr_end, delim_len = crlf2, 4
+            break
+        elif lf2 != -1:
+            hdr_end, delim_len = lf2, 2
+            break
+        chunk = sock.recv(4096)
+        if not chunk:
+            if not buf:
+                return None        # clean EOF between requests
+            raise HTTPError(400, "Bad Request", "Incomplete headers", close_connection=True)
+        buf.extend(chunk)
+
+    header_bytes = bytes(buf[:hdr_end])
+    del buf[:hdr_end + delim_len]
+
+    try:
+        header_text = header_bytes.decode("iso-8859-1")
+    except UnicodeDecodeError:
+        raise HTTPError(400, "Bad Request", "Header decode error", close_connection=True)
+
+    lines = [l.strip() for l in header_text.replace("\r\n", "\n").split("\n") if l.strip()]
+    if not lines:
+        raise HTTPError(400, "Bad Request", "Empty request", close_connection=True)
+
+    # Request line
+    parts = lines[0].split()
+    if len(parts) == 3:
+        method, target, version = parts
+    elif len(parts) == 2:
+        method, target, version = parts[0], parts[1], "HTTP/1.0"
+    else:
+        raise HTTPError(400, "Bad Request", "Bad request line", close_connection=True)
+
+    # Headers
+    headers: Dict[str, str] = {}
+    for line in lines[1:]:
+        if ":" not in line:
+            raise HTTPError(400, "Bad Request", f"Bad header: {line}", close_connection=True)
+        k, v = line.split(":", 1)
+        headers[k.strip().lower()] = v.strip()
+
+    # Path + query
+    path, _, qs = target.partition("?")
+    query = parse_query_string(qs)
+
+    # Consume body — exactly Content-Length bytes, not one more
+    body = b""
+    te = headers.get("transfer-encoding", "").lower()
+    cl = headers.get("content-length")
+
+    if "chunked" in te:
+        # RFC 7230 §4.1 chunked decoding
+        parts_list = []
+        while True:
+            size_line = _read_line(sock, buf)
+            chunk_size = int(size_line.split(b";")[0].strip(), 16)
+            if chunk_size == 0:
+                while _read_line(sock, buf):  # consume trailers
+                    pass
+                break
+            parts_list.append(_read_exact(sock, buf, chunk_size))
+            _read_line(sock, buf)  # trailing CRLF after chunk data
+        body = b"".join(parts_list)
+    elif cl is not None:
+        try:
+            n = int(cl)
+            if n < 0:
+                raise ValueError
+        except ValueError:
+            raise HTTPError(400, "Bad Request", "Bad Content-Length", close_connection=True)
+        body = _read_exact(sock, buf, n)
+
+    # HTTP/1.1 requires a Host header (RFC 7230 §5.4)
+    if "host" not in headers:
+        raise HTTPError(400, "Bad Request", "Host header required")
+
+    return Request(method, target, path, query, version, headers, body)
+
+
+def handle_client_connection(
+    client_sock: socket.socket,
+    client_addr,
+    idle_timeout: float = 10.0
+) -> None:
+    """Serve requests on a persistent connection until close or timeout."""
+    client_sock.settimeout(idle_timeout)
+    client_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    buf = bytearray()
+    try:
+        while True:
+            try:
+                req = parse_one_request(client_sock, buf)
+            except socket.timeout:
+                if not buf:
+                    break
+                client_sock.sendall(build_response(408, "Request Timeout", "Request Timeout", close_connection=True))
+                break
+            except HTTPError as e:
+                client_sock.sendall(build_response(e.status_code, e.reason, e.message, close_connection=e.close_connection))
+                if e.close_connection:
+                    break
+                continue
+            except (ConnectionResetError, BrokenPipeError):
+                break
+
+            if req is None:
+                break
+
+            # Placeholder: will be replaced with real routing
+            client_sock.sendall(build_response(501, "Not Implemented", "Calculator not yet wired up"))
+    except Exception:
+        pass
+    finally:
+        try:
+            client_sock.close()
+        except Exception:
+            pass
+
+
 def run_server(host: str = "0.0.0.0", port: int = 8080, idle_timeout: float = 10.0) -> None:
     """Bind the TCP socket and start accepting connections."""
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
